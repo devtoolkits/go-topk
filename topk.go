@@ -22,6 +22,7 @@ import (
 	"container/heap"
 	"encoding/gob"
 	"sort"
+	"sync"
 
 	"github.com/dgryski/go-sip13"
 )
@@ -44,33 +45,48 @@ func (elts elementsByCountDescending) Swap(i, j int) { elts[i], elts[j] = elts[j
 type keys struct {
 	m    map[string]int
 	elts []Element
+	sync.RWMutex
 }
 
 // Implement the container/heap interface
 
-func (tk *keys) Len() int { return len(tk.elts) }
+func (tk *keys) Len() int {
+	tk.RLock()
+	defer tk.RUnlock()
+
+	return len(tk.elts)
+}
+
 func (tk *keys) Less(i, j int) bool {
+	tk.RLock()
+	defer tk.RUnlock()
+
 	return (tk.elts[i].Count < tk.elts[j].Count) || (tk.elts[i].Count == tk.elts[j].Count && tk.elts[i].Error > tk.elts[j].Error)
 }
 func (tk *keys) Swap(i, j int) {
-
+	tk.Lock()
 	tk.elts[i], tk.elts[j] = tk.elts[j], tk.elts[i]
 
 	tk.m[tk.elts[i].Key] = i
 	tk.m[tk.elts[j].Key] = j
+	tk.Unlock()
 }
 
 func (tk *keys) Push(x interface{}) {
 	e := x.(Element)
+	tk.Lock()
 	tk.m[e.Key] = len(tk.elts)
 	tk.elts = append(tk.elts, e)
+	tk.Unlock()
 }
 
 func (tk *keys) Pop() interface{} {
 	var e Element
+	tk.Lock()
 	e, tk.elts = tk.elts[len(tk.elts)-1], tk.elts[:len(tk.elts)-1]
 
 	delete(tk.m, e.Key)
+	tk.Unlock()
 
 	return e
 }
@@ -102,22 +118,36 @@ func (s *Stream) Insert(x string, count int) Element {
 	xhash := reduce(sip13.Sum64Str(0, 0, x), len(s.alphas))
 
 	// are we tracking this element?
-	if idx, ok := s.k.m[x]; ok {
+	s.k.RLock()
+	idx, ok := s.k.m[x]
+	s.k.RUnlock()
+
+	if ok {
+		s.k.Lock()
 		s.k.elts[idx].Count += count
+		s.k.Unlock()
+		s.k.RLock()
 		e := s.k.elts[idx]
+		s.k.RUnlock()
 		heap.Fix(&s.k, idx)
 		return e
 	}
 
 	// can we track more elements?
-	if len(s.k.elts) < s.n {
+	s.k.RLock()
+	eltsSize := len(s.k.elts)
+	s.k.RUnlock()
+	if eltsSize < s.n {
 		// there is free space
 		e := Element{Key: x, Count: count}
 		heap.Push(&s.k, e)
 		return e
 	}
 
-	if s.alphas[xhash]+count < s.k.elts[0].Count {
+	s.k.RLock()
+	elt := s.k.elts[0].Count
+	s.k.RUnlock()
+	if s.alphas[xhash]+count < elt {
 		e := Element{
 			Key:   x,
 			Error: s.alphas[xhash],
@@ -128,22 +158,30 @@ func (s *Stream) Insert(x string, count int) Element {
 	}
 
 	// replace the current minimum element
+	s.k.RLock()
 	minKey := s.k.elts[0].Key
+	s.k.RUnlock()
 
 	mkhash := reduce(sip13.Sum64Str(0, 0, minKey), len(s.alphas))
+	s.k.RLock()
 	s.alphas[mkhash] = s.k.elts[0].Count
+	s.k.RUnlock()
 
 	e := Element{
 		Key:   x,
 		Error: s.alphas[xhash],
 		Count: s.alphas[xhash] + count,
 	}
+	s.k.Lock()
 	s.k.elts[0] = e
+	s.k.Unlock()
 
 	// we're not longer monitoring minKey
+	s.k.Lock()
 	delete(s.k.m, minKey)
 	// but 'x' is as array position 0
 	s.k.m[x] = 0
+	s.k.Unlock()
 
 	heap.Fix(&s.k, 0)
 	return e
